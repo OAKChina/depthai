@@ -25,7 +25,6 @@ class XoutBase(ABC):
     queue: Queue  # Queue to which synced Packets will be added. Main thread will get these
     _streams: List[str]  # Streams to listen for
     _visualizer: Visualizer
-    _visualizer_enabled: bool
     _fps: FPS
     name: str  # Other Xouts will override this
 
@@ -85,12 +84,7 @@ class XoutBase(ABC):
 
                 self.on_callback(packet)
 
-                if self._visualizer_enabled:
-                    try:
-                        self._visualizer.frame_shape = packet.frame.shape
-                    except AttributeError:
-                        pass  # Not all packets have frame attribute
-
+                if self._visualizer:
                     self.visualize(packet)
                 else:
                     # User defined callback
