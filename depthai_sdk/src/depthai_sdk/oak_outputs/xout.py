@@ -532,6 +532,14 @@ class XoutNnResults(XoutSeqSync, XoutFrames):
                     l = self.normalizer.normalize(frame=self.mock_frame, bbox=landmark)
                     self._visualizer.add_line(pt1=tuple(l[0]), pt2=tuple(l[1]), color=colors[i])
 
+    def visualize(self, packet: Union[DetectionPacket, TrackerPacket]):
+        # We can't visualize NNData (not decoded)
+        if isinstance(packet, DetectionPacket) and isinstance(packet.img_detections, dai.NNData):
+            raise Exception(
+                "Can't visualize this NN result because it's not an object detection model!"
+                "Use oak.callback() instead."
+            )
+
         super().visualize(packet)
 
     def package(self, msgs: Dict):
