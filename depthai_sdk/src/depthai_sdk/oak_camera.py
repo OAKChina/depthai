@@ -163,6 +163,7 @@ class OakCamera:
                       fps: Optional[float] = None,
                       left: Union[None, dai.Node.Output, CameraComponent] = None,  # Left mono camera
                       right: Union[None, dai.Node.Output, CameraComponent] = None,  # Right mono camera
+                      encode: Union[None, str, bool, dai.VideoEncoderProperties.Profile] = None
                       ) -> StereoComponent:
         """
         Create Stereo camera component. If left/right cameras/component aren't specified they will get created internally.
@@ -179,7 +180,8 @@ class OakCamera:
                                left=left,
                                right=right,
                                replay=self.replay,
-                               args=self._args)
+                               args=self._args,
+                               encode=encode)
         self._components.append(comp)
         return comp
 
