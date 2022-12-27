@@ -498,11 +498,11 @@ class XoutNnResults(XoutSeqSync, XoutFrames):
 
         self.normalizer = NormalizeBoundingBox(det_nn._size, det_nn._ar_resize_mode)
         try:
-            self.frame_shape = self.det_nn._input.node.getPreviewSize()
+            self._frame_shape = self.det_nn._input.node.getPreviewSize()
         except AttributeError:
-            self.frame_shape = self.det_nn._input.stream_size  # Replay
+            self._frame_shape = self.det_nn._input.stream_size  # Replay
 
-        self.frame_shape = np.array(self.frame_shape)[::-1]
+        self._frame_shape = np.array(self._frame_shape)[::-1]
 
     def setup_visualize(self,
                         visualizer: Visualizer,
@@ -513,7 +513,7 @@ class XoutNnResults(XoutSeqSync, XoutFrames):
     def on_callback(self, packet: Union[DetectionPacket, TrackerPacket]):
         if self._visualizer.frame_shape is None:
             if packet.frame.ndim == 1:
-                self._visualizer.frame_shape = self.frame_shape
+                self._visualizer.frame_shape = self._frame_shape
             else:
                 self._visualizer.frame_shape = packet.frame.shape
 
@@ -640,7 +640,7 @@ class XoutTracker(XoutNnResults):
 
         if self._visualizer.frame_shape is None:
             if packet.frame.ndim == 1:
-                self._visualizer.frame_shape = self.frame_shape
+                self._visualizer.frame_shape = self._frame_shape
             else:
                 self._visualizer.frame_shape = packet.frame.shape
 
