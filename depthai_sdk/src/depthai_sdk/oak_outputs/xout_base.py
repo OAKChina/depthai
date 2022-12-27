@@ -86,11 +86,6 @@ class XoutBase(ABC):
                 self.on_callback(packet)
 
                 if self._visualizer_enabled:
-                    try:
-                        self._visualizer.frame_shape = packet.frame.shape
-                    except AttributeError:
-                        pass  # Not all packets have frame attribute
-
                     self.visualize(packet)
                 else:
                     # User defined callback
