@@ -10,7 +10,7 @@ name: Upload Python Package
 
 on:
   release:
-    tag-name-pattern: '^v*-sdk$'
+    tag-name-pattern: 'v(\d+.?)*-sdk'
 #     types: [published]
 
 permissions:
