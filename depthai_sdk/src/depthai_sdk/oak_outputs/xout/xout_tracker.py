@@ -1,10 +1,10 @@
+import logging
 import math
 from collections import defaultdict
 from typing import Union, Dict, Optional
 
 import depthai as dai
 import numpy as np
-
 from depthai_sdk.classes import DetectionPacket, TrackerPacket
 from depthai_sdk.classes.packets import _TrackingDetection
 from depthai_sdk.oak_outputs.xout.xout_base import StreamXout
@@ -47,7 +47,9 @@ class XoutTracker(XoutNnResults):
         super().setup_visualize(visualizer, visualizer_enabled, name)
 
     def on_callback(self, packet: Union[DetectionPacket, TrackerPacket]):
-        self._set_frame_shape(packet)
+        if self._visualizer:
+            self._visualizer.frame_shape = self._frame_shape
+
         spatial_points = self._get_spatial_points(packet)
 
         threshold = self.forget_after_n_frames
@@ -284,13 +286,12 @@ class XoutTracker(XoutNnResults):
     @staticmethod
     def _get_spatial_points(packet) -> list:
         try:
-            # print(packet._is_spatial_detection())
-            # if packet._is_spatial_detection():
-            spatial_points = [packet._get_spatials(det.srcImgDetection)
-                              for det in
-                              packet.daiTracklets.tracklets]
-            # else:
-            #     spatial_points = None
+            if packet._is_spatial_detection():
+                spatial_points = [packet._get_spatials(det.srcImgDetection)
+                                  for det in
+                                  packet.daiTracklets.tracklets]
+            else:
+                spatial_points = None
         except IndexError:
             spatial_points = None
 
@@ -334,7 +335,7 @@ class XoutTracker(XoutNnResults):
             fov = calib.getFov(calib.getStereoLeftCameraId())
             self.focal = (cam_info.width / 2) / (2. * math.tan(math.radians(fov / 2)))
         else:
-            print("Warning: calibration data missing, using OAK-D defaults")
+            logging.warning("Calibration data missing, using OAK-D defaults")
             self.baseline = 75
             self.focal = 440
 

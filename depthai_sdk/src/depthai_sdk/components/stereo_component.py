@@ -1,27 +1,31 @@
-from typing import Optional, Union, Any, Dict, Tuple
-import cv2
-import numpy as np
+import logging
 import warnings
 from enum import Enum
-import depthai as dai
+from typing import Optional, Union, Any, Dict, Tuple
 
+import cv2
+import depthai as dai
+import numpy as np
 from depthai_sdk.components.camera_component import CameraComponent
 from depthai_sdk.components.component import Component
 from depthai_sdk.components.parser import parse_cam_socket, parse_median_filter, parse_encode
+from depthai_sdk.components.undistort import _get_mesh
 from depthai_sdk.oak_outputs.xout.xout_base import XoutBase, StreamXout
 from depthai_sdk.oak_outputs.xout.xout_depth import XoutDepth
 from depthai_sdk.oak_outputs.xout.xout_disparity import XoutDisparity
+from depthai_sdk.oak_outputs.xout.xout_frames import XoutFrames
 from depthai_sdk.oak_outputs.xout.xout_h26x import XoutH26x
 from depthai_sdk.oak_outputs.xout.xout_mjpeg import XoutMjpeg
 from depthai_sdk.replay import Replay
 from depthai_sdk.visualize.configs import StereoColor
-from depthai_sdk.components.undistort import _get_mesh
+
 
 class WLSLevel(Enum):
     """WLS filter level"""
     LOW = (1000, 0.8)
     MEDIUM = (6000, 1.5)
     HIGH = (12000, 2.0)
+
 
 class StereoComponent(Component):
 
@@ -36,6 +40,7 @@ class StereoComponent(Component):
         return self.node.disparity
 
     def __init__(self,
+                 device: dai.Device,
                  pipeline: dai.Pipeline,
                  resolution: Union[None, str, dai.MonoCameraProperties.SensorResolution] = None,
                  fps: Optional[float] = None,
@@ -66,7 +71,7 @@ class StereoComponent(Component):
         self._left_stream: dai.Node.Output
         self._right_stream: dai.Node.Output
 
-        self.colormap = None
+        self.colormap = None  # for on-device colorization
 
         self._replay: Optional[Replay] = replay
         self._resolution: Optional[Union[str, dai.MonoCameraProperties.SensorResolution]] = resolution
@@ -80,13 +85,14 @@ class StereoComponent(Component):
         self.node: dai.node.StereoDepth = pipeline.createStereoDepth()
         self.node.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
 
+        # Encoder
         self.encoder = None
         if encode:
             self.encoder = pipeline.createVideoEncoder()
             # MJPEG by default
             self._encoderProfile = parse_encode(encode)
 
-        # Configuration variables
+        # Postprocessing options
         self._colorize = None
         self._postprocess_colormap = None
         self.wls_enabled = None
@@ -95,6 +101,68 @@ class StereoComponent(Component):
         self._wls_sigma = None
 
         self._undistortion_offset: Optional[int] = None
+
+        if not self._replay:
+            # Live stream, check whether we have correct cameras
+            if len(device.getCameraSensorNames()) == 1:
+                raise Exception('OAK-1 camera does not have Stereo camera pair!')
+
+            # If not specified, default to 400P resolution for faster processing
+            self._resolution = self._resolution or dai.MonoCameraProperties.SensorResolution.THE_400_P
+
+            if not self.left:
+                self.left = CameraComponent(device, pipeline, 'left', self._resolution, self._fps, replay=self._replay)
+            if not self.right:
+                self.right = CameraComponent(device, pipeline, 'right', self._resolution, self._fps, replay=self._replay)
+
+            if 0 < len(device.getIrDrivers()):
+                laser = self._args.get('irDotBrightness', None)
+                laser = laser if laser is not None else 800
+                if 0 < laser:
+                    device.setIrLaserDotProjectorBrightness(laser)
+                    logging.info(f'Setting IR laser dot projector brightness to {laser}mA')
+
+                led = self._args.get('irFloodBrightness', None)
+                if led is not None:
+                    device.setIrFloodLightBrightness(int(led))
+                    logging.info(f'Setting IR flood LED brightness to {int(led)}mA')
+
+            input_size = self._get_stream_size(self.left)
+            if input_size:
+                self.node.setInputResolution(*input_size)
+
+        self._left_stream = self._get_output_stream(self.left)
+        self._right_stream = self._get_output_stream(self.right)
+
+        if self._replay:  # Replay
+            self._replay.initStereoDepth(self.node, left_name=self.left._source, right_name=self.right._source)
+        else:
+            self._left_stream.link(self.node.left)
+            self._right_stream.link(self.node.right)
+
+        if self.encoder:
+            try:
+                fps = self.left.get_fps()  # CameraComponent
+            except AttributeError:
+                fps = self.left.getFps()  # MonoCamera
+
+            self.encoder.setDefaultProfilePreset(fps, self._encoderProfile)
+            self.node.disparity.link(self.encoder.input)
+
+        self.node.setRectifyEdgeFillColor(0)
+
+        if self._undistortion_offset is not None:
+            calibData = self._replay._calibData if self._replay else device.readCalibration()
+            w_frame, h_frame = self._get_stream_size(self.left)
+            mapX_left, mapY_left, mapX_right, mapY_right = self._get_maps(w_frame, h_frame, calibData)
+            mesh_l = _get_mesh(mapX_left, mapY_left)
+            mesh_r = _get_mesh(mapX_right, mapY_right)
+            meshLeft = list(mesh_l.tobytes())
+            meshRight = list(mesh_r.tobytes())
+            self.node.loadMeshData(meshLeft, meshRight)
+
+        if self._args:
+            self._config_stereo_args(self._args)
 
     def _get_output_stream(self, input: Union[
         CameraComponent, dai.node.MonoCamera, dai.node.ColorCamera, dai.Node.Output
@@ -111,7 +179,9 @@ class StereoComponent(Component):
             raise ValueError('get_output_stream() accepts either CameraComponent,'
                              'dai.node.MonoCamera, dai.node.ColorCamera, dai.Node.Output!')
 
-    def _get_stream_size(self, input: Union[CameraComponent, dai.node.MonoCamera, dai.node.ColorCamera, dai.Node.Output]) -> Optional[Tuple[int, int]]:
+    def _get_stream_size(self,
+                         input: Union[CameraComponent, dai.node.MonoCamera, dai.node.ColorCamera, dai.Node.Output]) -> \
+            Optional[Tuple[int, int]]:
         if isinstance(input, CameraComponent):
             return input.stream_size
         elif isinstance(input, dai.node.MonoCamera):
@@ -121,82 +191,7 @@ class StereoComponent(Component):
         else:
             return None
 
-    def on_init(self, pipeline: dai.Pipeline, device: dai.Device, version: dai.OpenVINO.Version):
-        if not self._replay:
-            # Live stream, check whether we have correct cameras
-            if len(device.getCameraSensorNames()) == 1:
-                raise Exception('OAK-1 camera does not have Stereo camera pair!')
-
-            if not self.left:
-                self.left = CameraComponent(pipeline, 'left', self._resolution, self._fps, replay=self._replay)
-                self.left.on_init(pipeline, device, version)
-            if not self.right:
-                self.right = CameraComponent(pipeline, 'right', self._resolution, self._fps, replay=self._replay)
-                self.right.on_init(pipeline, device, version)
-
-            if 0 < len(device.getIrDrivers()):
-                laser = self._args.get('irDotBrightness', None)
-                laser = laser if laser is not None else 800
-                if 0 < laser:
-                    device.setIrLaserDotProjectorBrightness(laser)
-                    print(f'Setting IR laser dot projector brightness to {laser}mA')
-
-                led = self._args.get('irFloodBrightness', None)
-                if led is not None:
-                    device.setIrFloodLightBrightness(int(led))
-                    print(f'Setting IR flood LED brightness to {int(led)}mA')
-
-            input_size = self._get_stream_size(self.left)
-            if input_size:
-                self.node.setInputResolution(*input_size)
-
-        self._left_stream = self._get_output_stream(self.left)
-        self._right_stream = self._get_output_stream(self.right)
-
-        if self._replay:  # Replay
-            self._replay.initStereoDepth(self.node, left_name=self.left._source, right_name=self.right._source)
-        else:
-            self._left_stream.link(self.node.left)
-            self._right_stream.link(self.node.right)
-
-        colormap_manip = None
-        if self.colormap:
-            colormap_manip = pipeline.create(dai.node.ImageManip)
-            colormap_manip.initialConfig.setColormap(self.colormap, self.node.initialConfig.getMaxDisparity())
-            colormap_manip.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
-            colormap_manip.setMaxOutputFrameSize(1200 * 800 * 3)
-            self.node.disparity.link(colormap_manip.inputImage)
-
-        if self.encoder:
-            try:
-                fps = self.left.get_fps()  # CameraComponent
-            except AttributeError:
-                fps = self.left.getFps()  # MonoCamera
-
-            self.encoder.setDefaultProfilePreset(fps, self._encoderProfile)
-            if colormap_manip:
-                colormap_manip.out.link(self.encoder.input)
-            else:
-                self.node.disparity.link(self.encoder.input)
-
-        self.node.setRectifyEdgeFillColor(0)
-
-        if self._undistortion_offset is not None:
-
-            calibData = self._replay._calibData if self._replay else device.readCalibration()
-            w_frame, h_frame = self._get_stream_size(self.left)
-            mapX_left, mapY_left, mapX_right, mapY_right = self._get_maps(w_frame, h_frame, calibData)
-            mesh_l = _get_mesh(mapX_left, mapY_left)
-            mesh_r = _get_mesh(mapX_right, mapY_right)
-            meshLeft = list(mesh_l.tobytes())
-            meshRight = list(mesh_r.tobytes())
-            self.node.loadMeshData(meshLeft, meshRight)
-
-        if self._args:
-            self._config_stereo_args(self._args)
-
-
-    def config_undistortion(self, M2_offset:int =0):
+    def config_undistortion(self, M2_offset: int = 0):
         self._undistortion_offset = M2_offset
 
     def _config_stereo_args(self, args: Dict):
@@ -275,7 +270,7 @@ class StereoComponent(Component):
         if isinstance(wls_level, WLSLevel):
             self._wls_level = wls_level
         elif isinstance(wls_level, str):
-            self._wls_level = WLSLevel(wls_level.upper())
+            self._wls_level = WLSLevel[wls_level.upper()]
 
         self._wls_lambda = wls_lambda
         self._wls_sigma = wls_sigma
@@ -283,10 +278,26 @@ class StereoComponent(Component):
     def set_colormap(self, colormap: dai.Colormap):
         """
         Sets the colormap to use for colorizing the disparity map. Used for on-device postprocessing.
+        Works only with `encoded` output.
+        Note: This setting can affect the performance.
 
         Args:
             colormap: Colormap to use for colorizing the disparity map.
         """
+        if self.colormap != colormap and self.encoder:
+            colormap_manip = self.node.getParentPipeline().create(dai.node.ImageManip)
+            colormap_manip.initialConfig.setColormap(colormap, self.node.initialConfig.getMaxDisparity())
+            colormap_manip.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
+            h, w = self.left.stream_size
+            colormap_manip.setMaxOutputFrameSize(h * w * 3)
+            self.node.disparity.link(colormap_manip.inputImage)
+
+            if self.encoder:
+                self.node.disparity.unlink(self.encoder.input)
+                colormap_manip.out.link(self.encoder.input)
+        elif not self.encoder:
+            warnings.warn('At the moment, colormap can be used only if encoder is enabled.')
+
         self.colormap = colormap
 
     def _get_disparity_factor(self, device: dai.Device) -> float:
@@ -339,11 +350,7 @@ class StereoComponent(Component):
             return self.depth(pipeline, device)
 
         def disparity(self, pipeline: dai.Pipeline, device: dai.Device) -> XoutBase:
-            if self._comp.colormap:
-                warnings.warn('Colormap set with `set_colormap` is ignored when using disparity output. '
-                              'Please use `configure_postprocessing` instead.')
-
-            fps = self._comp.left.get_fps() if self._comp._replay is None else self._comp._replay.getFps()
+            fps = self._comp.left.get_fps() if self._comp._replay is None else self._comp._replay.get_fps()
 
             out = XoutDisparity(
                 disparity_frames=StreamXout(self._comp.node.id, self._comp.disparity, name=self._comp.name),
@@ -361,7 +368,7 @@ class StereoComponent(Component):
             return self._comp._create_xout(pipeline, out)
 
         def rectified_left(self, pipeline: dai.Pipeline, device: dai.Device) -> XoutBase:
-            fps = self._comp.left.getFps() if self._comp._replay is None else self._comp._replay.get_fps()
+            fps = self._comp.left.get_fps() if self._comp._replay is None else self._comp._replay.get_fps()
             out = XoutFrames(
                 frames=StreamXout(self._comp.node.id, self._comp.node.rectifiedLeft),
                 fps=fps)
@@ -369,20 +376,15 @@ class StereoComponent(Component):
             return self._comp._create_xout(pipeline, out)
 
         def rectified_right(self, pipeline: dai.Pipeline, device: dai.Device) -> XoutBase:
-            fps = self._comp.left.getFps() if self._comp._replay is None else self._comp._replay.get_fps()
+            fps = self._comp.left.get_fps() if self._comp._replay is None else self._comp._replay.get_fps()
             out = XoutFrames(
                 frames=StreamXout(self._comp.node.id, self._comp.node.rectifiedRight),
                 fps=fps)
             out.name = 'Rectified right'
             return self._comp._create_xout(pipeline, out)
 
-
         def depth(self, pipeline: dai.Pipeline, device: dai.Device) -> XoutBase:
-            if self._comp.colormap:
-                warnings.warn('Colormap set with `set_colormap` is ignored when using depth output. '
-                              'Please use `configure_postprocessing` instead.')
-
-            fps = self._comp.left.get_fps() if self._comp._replay is None else self._comp._replay.getFps()
+            fps = self._comp.left.get_fps() if self._comp._replay is None else self._comp._replay.get_fps()
             out = XoutDepth(
                 device=device,
                 frames=StreamXout(self._comp.node.id, self._comp.depth, name=self._comp.name),
